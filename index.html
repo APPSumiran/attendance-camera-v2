@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Attendance Camera — Automatic Scan</title>
+<style>
+body{font:16px/1.45 Arial,sans-serif;max-width:760px;margin:0 auto;padding:20px;background:#f3f6fa;color:#182638}
+main{background:white;border:1px solid #dce4ed;border-radius:16px;padding:20px}
+video{width:100%;max-height:65vh;object-fit:cover;background:#101820;border-radius:12px}
+button{border:0;border-radius:9px;padding:12px 16px;font-weight:700;cursor:pointer;margin:8px 8px 0 0}
+.primary{background:#1769aa;color:white}.secondary{background:#e8f1f8;color:#164c79}
+.notice{padding:12px;border-radius:9px;background:#e8f1f8}.error{background:#fff0f0;color:#8d252c}
+.actions{display:flex;flex-wrap:wrap}small{color:#65758b}
+</style>
+</head>
+<body><main>
+<h1>Attendance Camera</h1>
+<p>The camera scans automatically. When it detects a clear face for several consecutive frames, it captures one image and sends it to the attendance page for employee matching. It does not perform liveness detection.</p>
+<video id="video" autoplay muted playsinline></video>
+<div id="status" class="notice" role="status">Choose Start Camera to grant camera access. No capture button is needed.</div>
+<div class="actions">
+  <button class="primary" id="start" type="button">Start Camera</button>
+  <button class="secondary" id="stop" type="button" disabled>Stop Camera</button>
+</div>
+<p><small>Keep the attendance tab open. The image is sent directly to the tab that opened this page; this GitHub Pages site does not upload it to a server.</small></p>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<script>
+'use strict';
+const video=document.getElementById('video');
+const statusEl=document.getElementById('status');
+const startBtn=document.getElementById('start');
+const stopBtn=document.getElementById('stop');
+const modelBase='https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights';
+let stream=null, scanning=false, sent=false, loopBusy=false, stableFrames=0, lastDetectionAt=0;
+
+function status(msg,error){
+  statusEl.textContent=msg;
+  statusEl.className='notice'+(error?' error':'');
+}
+function stop(){
+  scanning=false;
+  if(stream) stream.getTracks().forEach(track=>track.stop());
+  stream=null;
+  video.srcObject=null;
+  stopBtn.disabled=true;
+  startBtn.disabled=false;
+}
+async function scanLoop(){
+  if(!scanning||sent||loopBusy) return;
+  loopBusy=true;
+  try{
+    if(video.readyState>=2 && window.faceapi){
+      const detection=await faceapi.detectSingleFace(
+        video,new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.55})
+      );
+      if(detection){
+        stableFrames++;
+        lastDetectionAt=Date.now();
+        status('Face detected. Hold still… ('+Math.min(stableFrames,5)+'/5)');
+      }else{
+        if(Date.now()-lastDetectionAt>700) stableFrames=0;
+        status('Looking for a clear face…');
+      }
+      if(stableFrames>=5){
+        sent=true;
+        scanning=false;
+        status('Face detected steadily. Capturing and validating…');
+        const canvas=document.createElement('canvas');
+        const maxWidth=960;
+        const scale=Math.min(1,maxWidth/video.videoWidth);
+        canvas.width=Math.round(video.videoWidth*scale);
+        canvas.height=Math.round(video.videoHeight*scale);
+        canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
+        const imageDataUrl=canvas.toDataURL('image/jpeg',0.78);
+        if(!window.opener||window.opener.closed) throw new Error('The original attendance tab is not available. Reopen this camera page using Start Face Scan from the attendance app.');
+        const referrerOrigin=(()=>{try{return new URL(document.referrer).origin;}catch(e){return '';}})();
+        if(!referrerOrigin) throw new Error('Could not verify the attendance tab. Reopen this page from the attendance app.');
+        window.opener.postMessage({type:'attendance-camera-capture',imageDataUrl},referrerOrigin);
+        stop();
+        status('Photo sent automatically to the attendance tab. Return to that tab to see the match result.');
+        return;
+      }
+    }
+  }catch(e){
+    scanning=false;
+    status('Automatic scan failed: '+(e.message||String(e))+'. You can retry.',true);
+    stop();
+    return;
+  }finally{
+    loopBusy=false;
+  }
+  if(scanning&&!sent) requestAnimationFrame(scanLoop);
+}
+startBtn.addEventListener('click',async()=>{
+  try{
+    if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia) throw new Error('Camera access requires HTTPS and a supported browser.');
+    if(!window.faceapi) throw new Error('Face detection library did not load. Check internet access or CDN restrictions.');
+    startBtn.disabled=true;
+    status('Requesting camera permission…');
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});
+    video.srcObject=stream;
+    await video.play();
+    status('Loading face detector…');
+    await faceapi.nets.tinyFaceDetector.loadFromUri(modelBase);
+    stableFrames=0;lastDetectionAt=0;sent=false;scanning=true;
+    stopBtn.disabled=false;
+    status('Camera ready. Center your face in the frame; capture will happen automatically.');
+    requestAnimationFrame(scanLoop);
+  }catch(e){
+    stop();
+    status('Camera unavailable: '+(e.message||String(e))+'. Check this GitHub Pages site camera permission and Windows camera settings.',true);
+  }
+});
+stopBtn.addEventListener('click',()=>{stop();status('Camera stopped.');});
+window.addEventListener('beforeunload',stop);
+</script>
+</body>
+</html>
