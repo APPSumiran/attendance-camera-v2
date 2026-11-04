@@ -17,9 +17,8 @@ button{border:0;border-radius:9px;padding:12px 16px;font-weight:700;cursor:point
 <h1>Attendance Camera</h1>
 <p>The camera scans automatically. When it detects a clear face for several consecutive frames, it captures one image and sends it to the attendance page for employee matching. It does not perform liveness detection.</p>
 <video id="video" autoplay muted playsinline></video>
-<div id="status" class="notice" role="status">Choose Start Camera to grant camera access. No capture button is needed.</div>
+<div id="status" class="notice" role="status" aria-live="polite">Opening camera and loading face scanner…</div>
 <div class="actions">
-  <button class="primary" id="start" type="button">Start Camera</button>
   <button class="secondary" id="stop" type="button" disabled>Stop Camera</button>
 </div>
 <p><small>Keep the attendance tab open. The image is sent directly to the tab that opened this page; this GitHub Pages site does not upload it to a server.</small></p>
@@ -29,7 +28,6 @@ button{border:0;border-radius:9px;padding:12px 16px;font-weight:700;cursor:point
 'use strict';
 const video=document.getElementById('video');
 const statusEl=document.getElementById('status');
-const startBtn=document.getElementById('start');
 const stopBtn=document.getElementById('stop');
 const modelBase='https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights';
 let stream=null, scanning=false, sent=false, loopBusy=false, stableFrames=0, lastDetectionAt=0;
@@ -44,7 +42,6 @@ function stop(){
   stream=null;
   video.srcObject=null;
   stopBtn.disabled=true;
-  startBtn.disabled=false;
 }
 async function scanLoop(){
   if(!scanning||sent||loopBusy) return;
@@ -92,11 +89,10 @@ async function scanLoop(){
   }
   if(scanning&&!sent) requestAnimationFrame(scanLoop);
 }
-startBtn.addEventListener('click',async()=>{
+async function startCamera(){
   try{
     if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia) throw new Error('Camera access requires HTTPS and a supported browser.');
     if(!window.faceapi) throw new Error('Face detection library did not load. Check internet access or CDN restrictions.');
-    startBtn.disabled=true;
     status('Requesting camera permission…');
     stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});
     video.srcObject=stream;
@@ -111,9 +107,12 @@ startBtn.addEventListener('click',async()=>{
     stop();
     status('Camera unavailable: '+(e.message||String(e))+'. Check this GitHub Pages site camera permission and Windows camera settings.',true);
   }
-});
+}
 stopBtn.addEventListener('click',()=>{stop();status('Camera stopped.');});
 window.addEventListener('beforeunload',stop);
+
+// Start camera and face scanning automatically when this page opens.
+startCamera();
 </script>
 </body>
 </html>
