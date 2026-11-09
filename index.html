@@ -1,28 +1,49 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Attendance Camera — Automatic Scan</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Attendance Camera — Accurate Automatic Scan</title>
 <style>
-body{font:16px/1.45 Arial,sans-serif;max-width:760px;margin:0 auto;padding:20px;background:#f3f6fa;color:#182638}
-main{background:white;border:1px solid #dce4ed;border-radius:16px;padding:20px}
-video{width:100%;max-height:65vh;object-fit:cover;background:#101820;border-radius:12px}
+:root{color-scheme:light}
+*{box-sizing:border-box}
+body{font:16px/1.5 Arial,sans-serif;max-width:760px;margin:0 auto;padding:20px;background:#f3f6fa;color:#182638}
+main{background:#fff;border:1px solid #dce4ed;border-radius:16px;padding:20px;box-shadow:0 8px 28px rgba(24,38,56,.06)}
+h1{margin-top:0}
+.video-wrap{position:relative;background:#101820;border-radius:12px;overflow:hidden}
+video{display:block;width:100%;max-height:65vh;min-height:240px;object-fit:cover;transform:scaleX(-1)}
+#guide{position:absolute;inset:10% 18%;border:2px solid rgba(255,255,255,.8);border-radius:48%;pointer-events:none;box-shadow:0 0 0 999px rgba(0,0,0,.08)}
 button{border:0;border-radius:9px;padding:12px 16px;font-weight:700;cursor:pointer;margin:8px 8px 0 0}
+button:disabled{opacity:.5;cursor:not-allowed}
 .primary{background:#1769aa;color:white}.secondary{background:#e8f1f8;color:#164c79}
-.notice{padding:12px;border-radius:9px;background:#e8f1f8}.error{background:#fff0f0;color:#8d252c}
-.actions{display:flex;flex-wrap:wrap}small{color:#65758b}
+.notice{padding:12px;border-radius:9px;background:#e8f1f8;min-height:48px}
+.error{background:#fff0f0;color:#8d252c}
+.actions{display:flex;flex-wrap:wrap}
+small{color:#65758b}
+.progress{height:6px;background:#e5edf4;border-radius:99px;overflow:hidden;margin-top:10px}
+#progressBar{height:100%;width:0;background:#1769aa;transition:width .15s}
+.tips{padding-left:20px;color:#52647a}
 </style>
 </head>
 <body><main>
 <h1>Attendance Camera</h1>
-<p>The camera scans automatically. When it detects a clear face for several consecutive frames, it captures one image and sends it to the attendance page for employee matching. It does not perform liveness detection.</p>
-<video id="video" autoplay muted playsinline></video>
-<div id="status" class="notice" role="status">Choose Start Camera to grant camera access. No capture button is needed.</div>
+<p>Center your face in the guide and hold still. The scanner checks that one face is visible, sufficiently large, well-lit, and stable before capturing.</p>
+<div class="video-wrap">
+  <video id="video" autoplay muted playsinline></video>
+  <div id="guide" aria-hidden="true"></div>
+</div>
+<div id="status" class="notice" role="status" aria-live="polite">Choose Start Camera to grant camera access. No capture button is needed.</div>
+<div class="progress" aria-hidden="true"><div id="progressBar"></div></div>
 <div class="actions">
   <button class="primary" id="start" type="button">Start Camera</button>
   <button class="secondary" id="stop" type="button" disabled>Stop Camera</button>
 </div>
-<p><small>Keep the attendance tab open. The image is sent directly to the tab that opened this page; this GitHub Pages site does not upload it to a server.</small></p>
+<ul class="tips">
+  <li>Face the camera directly and remove anything covering your face.</li>
+  <li>Use even lighting; avoid strong backlighting and shadows.</li>
+  <li>Keep your face inside the oval and hold still until capture.</li>
+</ul>
+<p><small>Keep the attendance tab open. The image is sent directly to the tab that opened this page; this GitHub Pages site does not upload it to a server. This scanner does not perform liveness detection.</small></p>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
 <script>
@@ -31,66 +52,168 @@ const video=document.getElementById('video');
 const statusEl=document.getElementById('status');
 const startBtn=document.getElementById('start');
 const stopBtn=document.getElementById('stop');
-const modelBase='https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights';
-let stream=null, scanning=false, sent=false, loopBusy=false, stableFrames=0, lastDetectionAt=0;
+const progressBar=document.getElementById('progressBar');
 
-function status(msg,error){
-  statusEl.textContent=msg;
+const modelBase='https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights';
+const REQUIRED_STABLE_FRAMES=4;
+const SCAN_INTERVAL_MS=160;
+const MIN_FACE_WIDTH=120;
+const MIN_FACE_HEIGHT=120;
+const MIN_DETECTION_SCORE=0.62;
+const MAX_CENTER_MOVEMENT=0.055;
+const MIN_BOX_IOU=0.72;
+
+let stream=null, scanning=false, sent=false, loopBusy=false;
+let stableFrames=0, previousBox=null, scanTimer=null, captureCanvas=null;
+
+function status(message,error=false){
+  statusEl.textContent=message;
   statusEl.className='notice'+(error?' error':'');
+}
+function setProgress(){
+  progressBar.style.width=Math.min(100,stableFrames/REQUIRED_STABLE_FRAMES*100)+'%';
+}
+function resetStability(){
+  stableFrames=0;
+  previousBox=null;
+  setProgress();
 }
 function stop(){
   scanning=false;
+  if(scanTimer!==null){clearTimeout(scanTimer);scanTimer=null;}
   if(stream) stream.getTracks().forEach(track=>track.stop());
   stream=null;
   video.srcObject=null;
   stopBtn.disabled=true;
   startBtn.disabled=false;
+  loopBusy=false;
+}
+function intersectionOverUnion(a,b){
+  const left=Math.max(a.x,b.x), top=Math.max(a.y,b.y);
+  const right=Math.min(a.x+a.width,b.x+b.width);
+  const bottom=Math.min(a.y+a.height,b.y+b.height);
+  const intersection=Math.max(0,right-left)*Math.max(0,bottom-top);
+  const union=a.width*a.height+b.width*b.height-intersection;
+  return union>0?intersection/union:0;
+}
+function faceIsStable(box){
+  if(!previousBox){previousBox=box;stableFrames=1;return true;}
+  const oldCenterX=previousBox.x+previousBox.width/2;
+  const oldCenterY=previousBox.y+previousBox.height/2;
+  const newCenterX=box.x+box.width/2;
+  const newCenterY=box.y+box.height/2;
+  const movement=Math.hypot(newCenterX-oldCenterX,newCenterY-oldCenterY)/Math.max(video.videoWidth,video.videoHeight);
+  const sizeChange=Math.abs(box.width-previousBox.width)/Math.max(previousBox.width,1);
+  const overlap=intersectionOverUnion(previousBox,box);
+  const stable=movement<=MAX_CENTER_MOVEMENT && sizeChange<=0.18 && overlap>=MIN_BOX_IOU;
+  if(stable) stableFrames++;
+  else stableFrames=1;
+  previousBox=box;
+  return stable;
+}
+function assessFaceImage(box){
+  const canvas=document.createElement('canvas');
+  const width=96,height=96;
+  canvas.width=width;canvas.height=height;
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(video,box.x,box.y,box.width,box.height,0,0,width,height);
+  const pixels=ctx.getImageData(0,0,width,height).data;
+  let luminance=0;
+  for(let i=0;i<pixels.length;i+=4){
+    luminance+=0.2126*pixels[i]+0.7152*pixels[i+1]+0.0722*pixels[i+2];
+  }
+  luminance/=width*height;
+  if(luminance<48) return {ok:false,message:'Your face is too dark. Move to a brighter, evenly lit area.'};
+  if(luminance>220) return {ok:false,message:'Lighting is too bright. Avoid direct light on your face.'};
+
+  // Estimate sharpness from the variance of a simple grayscale Laplacian.
+  const gray=new Float32Array(width*height);
+  for(let p=0,j=0;p<gray.length;p++,j+=4){
+    gray[p]=0.2126*pixels[j]+0.7152*pixels[j+1]+0.0722*pixels[j+2];
+  }
+  let sum=0,sumSq=0,count=0;
+  for(let y=1;y<height-1;y++){
+    for(let x=1;x<width-1;x++){
+      const p=y*width+x;
+      const lap=4*gray[p]-gray[p-1]-gray[p+1]-gray[p-width]-gray[p+width];
+      sum+=lap;sumSq+=lap*lap;count++;
+    }
+  }
+  const variance=sumSq/count-(sum/count)*(sum/count);
+  if(variance<22) return {ok:false,message:'Your face looks blurry. Hold still and improve the lighting.'};
+  return {ok:true};
+}
+async function sendCapture(box){
+  const maxWidth=1280;
+  const scale=Math.min(1,maxWidth/video.videoWidth);
+  const canvas=document.createElement('canvas');
+  canvas.width=Math.round(video.videoWidth*scale);
+  canvas.height=Math.round(video.videoHeight*scale);
+  const ctx=canvas.getContext('2d');
+  if(!ctx) throw new Error('Could not prepare the camera image.');
+  // Send the unmirrored camera image; mirroring is only for the on-screen preview.
+  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+  const imageDataUrl=canvas.toDataURL('image/jpeg',0.90);
+  if(!window.opener||window.opener.closed) throw new Error('The original attendance tab is not available. Reopen this camera page using Start Face Scan from the attendance app.');
+  let targetOrigin='';
+  try{targetOrigin=new URL(document.referrer).origin;}catch(e){}
+  if(!targetOrigin||targetOrigin==='null') throw new Error('Could not verify the attendance tab. Reopen this page from the attendance app.');
+  window.opener.postMessage({type:'attendance-camera-capture',imageDataUrl},targetOrigin);
+  sent=true;
+  stop();
+  status('Photo sent to the attendance tab. Return there to review the employee match.');
 }
 async function scanLoop(){
   if(!scanning||sent||loopBusy) return;
   loopBusy=true;
   try{
-    if(video.readyState>=2 && window.faceapi){
-      const detection=await faceapi.detectSingleFace(
-        video,new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.55})
-      );
-      if(detection){
-        stableFrames++;
-        lastDetectionAt=Date.now();
-        status('Face detected. Hold still… ('+Math.min(stableFrames,5)+'/5)');
-      }else{
-        if(Date.now()-lastDetectionAt>700) stableFrames=0;
-        status('Looking for a clear face…');
-      }
-      if(stableFrames>=5){
-        sent=true;
-        scanning=false;
-        status('Face detected steadily. Capturing and validating…');
-        const canvas=document.createElement('canvas');
-        const maxWidth=960;
-        const scale=Math.min(1,maxWidth/video.videoWidth);
-        canvas.width=Math.round(video.videoWidth*scale);
-        canvas.height=Math.round(video.videoHeight*scale);
-        canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
-        const imageDataUrl=canvas.toDataURL('image/jpeg',0.78);
-        if(!window.opener||window.opener.closed) throw new Error('The original attendance tab is not available. Reopen this camera page using Start Face Scan from the attendance app.');
-        const referrerOrigin=(()=>{try{return new URL(document.referrer).origin;}catch(e){return '';}})();
-        if(!referrerOrigin) throw new Error('Could not verify the attendance tab. Reopen this page from the attendance app.');
-        window.opener.postMessage({type:'attendance-camera-capture',imageDataUrl},referrerOrigin);
-        stop();
-        status('Photo sent automatically to the attendance tab. Return to that tab to see the match result.');
-        return;
-      }
+    if(video.readyState<2||!video.videoWidth||!window.faceapi) return;
+    const options=new faceapi.SsdMobilenetv1Options({minConfidence:MIN_DETECTION_SCORE,maxResults:3});
+    const detections=await faceapi.detectAllFaces(video,options);
+    if(detections.length===0){
+      resetStability();
+      status('Looking for a clear face. Move into the oval and face the camera.');
+      return;
     }
-  }catch(e){
+    if(detections.length>1){
+      resetStability();
+      status('More than one face detected. Make sure only the employee being scanned is in view.');
+      return;
+    }
+    const detection=detections[0];
+    const box=detection.box;
+    if(detection.score<MIN_DETECTION_SCORE){
+      resetStability();
+      status('Face detection is uncertain. Move closer and face the camera.');
+      return;
+    }
+    if(box.width<MIN_FACE_WIDTH||box.height<MIN_FACE_HEIGHT){
+      resetStability();
+      status('Move a little closer so your face fills more of the guide.');
+      return;
+    }
+    const quality=assessFaceImage(box);
+    if(!quality.ok){
+      resetStability();
+      status(quality.message);
+      return;
+    }
+    faceIsStable(box);
+    setProgress();
+    status('Face looks clear. Hold still… ('+Math.min(stableFrames,REQUIRED_STABLE_FRAMES)+'/'+REQUIRED_STABLE_FRAMES+')');
+    if(stableFrames>=REQUIRED_STABLE_FRAMES){
+      scanning=false;
+      status('Face is stable. Capturing and sending…');
+      await sendCapture(box);
+    }
+  }catch(error){
     scanning=false;
-    status('Automatic scan failed: '+(e.message||String(e))+'. You can retry.',true);
     stop();
-    return;
+    status('Automatic scan failed: '+(error.message||String(error))+'. You can retry.',true);
   }finally{
     loopBusy=false;
+    if(scanning&&!sent) scanTimer=setTimeout(scanLoop,SCAN_INTERVAL_MS);
   }
-  if(scanning&&!sent) requestAnimationFrame(scanLoop);
 }
 startBtn.addEventListener('click',async()=>{
   try{
@@ -98,21 +221,31 @@ startBtn.addEventListener('click',async()=>{
     if(!window.faceapi) throw new Error('Face detection library did not load. Check internet access or CDN restrictions.');
     startBtn.disabled=true;
     status('Requesting camera permission…');
-    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{
+        facingMode:'user',
+        width:{ideal:1280},
+        height:{ideal:720},
+        frameRate:{ideal:30,max:30}
+      },
+      audio:false
+    });
     video.srcObject=stream;
     await video.play();
-    status('Loading face detector…');
-    await faceapi.nets.tinyFaceDetector.loadFromUri(modelBase);
-    stableFrames=0;lastDetectionAt=0;sent=false;scanning=true;
+    status('Loading accurate face detector…');
+    await faceapi.nets.ssdMobilenetv1.loadFromUri(modelBase);
+    resetStability();
+    sent=false;
+    scanning=true;
     stopBtn.disabled=false;
-    status('Camera ready. Center your face in the frame; capture will happen automatically.');
-    requestAnimationFrame(scanLoop);
-  }catch(e){
+    status('Camera ready. Center your face in the guide and hold still.');
+    scanLoop();
+  }catch(error){
     stop();
-    status('Camera unavailable: '+(e.message||String(e))+'. Check this GitHub Pages site camera permission and Windows camera settings.',true);
+    status('Camera unavailable: '+(error.message||String(error))+'. Check this GitHub Pages site camera permission and Windows camera settings.',true);
   }
 });
-stopBtn.addEventListener('click',()=>{stop();status('Camera stopped.');});
+stopBtn.addEventListener('click',()=>{stop();resetStability();status('Camera stopped.');});
 window.addEventListener('beforeunload',stop);
 </script>
 </body>
